@@ -1,0 +1,1578 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+agvpn - удобная консольная оболочка над AdGuard VPN CLI.
+
+Возможности:
+  * интерактивное меню (без аргументов) и полноценный CLI
+  * быстрое подключение, избранные локации, поиск по локациям с пингом
+  * читаемый статус: локация, режим, интерфейс, IP, трафик, время сессии
+  * управление настройками (режим, DNS, SOCKS, протокол, маршрутизация и пр.)
+  * исключения сайтов (general/selective), профили настроек
+  * kill switch-проверка утечек DNS/IP, watch-мониторинг, логи
+
+Требует установленный adguardvpn-cli.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+APP = "agvpn"
+VERSION = "1.0.0"
+
+BIN = os.environ.get("AGVPN_BIN") or shutil.which("adguardvpn-cli") or "adguardvpn-cli"
+DATA_DIR = Path.home() / ".local" / "share" / "adguardvpn-cli"
+CONF_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP
+STATE = CONF_DIR / "state.json"
+
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+NO_COLOR = bool(os.environ.get("NO_COLOR")) or not sys.stdout.isatty()
+
+
+class C:
+    """ANSI-цвета с автоотключением при отсутствии TTY."""
+
+    RESET = "" if NO_COLOR else "\033[0m"
+    B = "" if NO_COLOR else "\033[1m"
+    DIM = "" if NO_COLOR else "\033[2m"
+    RED = "" if NO_COLOR else "\033[31m"
+    GREEN = "" if NO_COLOR else "\033[32m"
+    YELLOW = "" if NO_COLOR else "\033[33m"
+    BLUE = "" if NO_COLOR else "\033[34m"
+    MAGENTA = "" if NO_COLOR else "\033[35m"
+    CYAN = "" if NO_COLOR else "\033[36m"
+    GREY = "" if NO_COLOR else "\033[90m"
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI.sub("", text or "")
+
+
+def say(msg: str = "") -> None:
+    print(msg)
+
+
+def ok(msg: str) -> None:
+    print(f"{C.GREEN}✔{C.RESET} {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"{C.YELLOW}!{C.RESET} {msg}")
+
+
+def err(msg: str) -> None:
+    print(f"{C.RED}✖{C.RESET} {msg}", file=sys.stderr)
+
+
+def info(msg: str) -> None:
+    print(f"{C.CYAN}·{C.RESET} {msg}")
+
+
+def head(title: str) -> None:
+    line = "─" * max(len(title) + 2, 34)
+    print(f"\n{C.B}{C.BLUE}{title}{C.RESET}\n{C.GREY}{line}{C.RESET}")
+
+
+# --------------------------------------------------------------------------
+# состояние (избранное, профили, история)
+# --------------------------------------------------------------------------
+
+DEFAULT_STATE = {"favorites": [], "profiles": {}, "history": [], "last_check": None}
+
+
+def load_state() -> dict:
+    try:
+        data = json.loads(STATE.read_text(encoding="utf-8"))
+        merged = dict(DEFAULT_STATE)
+        merged.update({k: v for k, v in data.items() if k in DEFAULT_STATE})
+        return merged
+    except Exception:
+        return dict(DEFAULT_STATE)
+
+
+def save_state(state: dict) -> None:
+    try:
+        CONF_DIR.mkdir(parents=True, exist_ok=True)
+        STATE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        warn(f"не удалось сохранить состояние: {exc}")
+
+
+def remember(location: str) -> None:
+    state = load_state()
+    hist = [h for h in state.get("history", []) if h != location]
+    hist.insert(0, location)
+    state["history"] = hist[:10]
+    save_state(state)
+
+# --------------------------------------------------------------------------
+# вызовы adguardvpn-cli
+# --------------------------------------------------------------------------
+
+
+def have_cli() -> bool:
+    return shutil.which(BIN) is not None or Path(BIN).exists()
+
+
+def run(args: list[str], timeout: int = 90) -> tuple[int, str, str]:
+    """Запустить adguardvpn-cli и вернуть (код, stdout, stderr) без ANSI."""
+    try:
+        proc = subprocess.run(
+            [BIN, *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return proc.returncode, strip_ansi(proc.stdout).strip(), strip_ansi(proc.stderr).strip()
+    except FileNotFoundError:
+        err(f"не найден adguardvpn-cli (искал: {BIN})")
+        say("Установка: curl -fsSL https://raw.githubusercontent.com/AdguardTeam/AdguardVPNCLI/HEAD/scripts/release/install.sh | sh -s -- -v")
+        sys.exit(127)
+    except subprocess.TimeoutExpired:
+        return 124, "", f"таймаут выполнения ({timeout}s)"
+
+
+def run_live(args: list[str]) -> int:
+    """Запустить с прямым выводом в терминал (для login/update/connect -v)."""
+    try:
+        return subprocess.call([BIN, *args])
+    except FileNotFoundError:
+        err(f"не найден adguardvpn-cli (искал: {BIN})")
+        return 127
+    except KeyboardInterrupt:
+        return 130
+
+
+def cli(args: list[str], quiet: bool = False, timeout: int = 90) -> tuple[bool, str]:
+    """Обёртка: печатает первую значимую строку вывода, возвращает (успех, текст)."""
+    code, out, error = run(args, timeout=timeout)
+    text = out or error
+    low = text.lower()
+
+    # Настройка записана, но не применилась к активному туннелю.
+    # adguardvpn-cli отдаёт ненулевой код — для нас это успех + подсказка.
+    if code != 0 and "config has been updated" in low:
+        if not quiet:
+            ok("настройка сохранена")
+            if "active connection" in low:
+                warn(f"чтобы применить, переподключитесь: {APP} r")
+        return True, text
+
+    if code == 0:
+        if not quiet and text:
+            for line in text.splitlines():
+                if line.strip():
+                    ok(line.strip())
+                    break
+        return True, text
+    if not quiet:
+        err(text or f"команда завершилась с кодом {code}")
+    return False, text
+
+
+# --------------------------------------------------------------------------
+# разбор статуса / конфигурации / локаций
+# --------------------------------------------------------------------------
+
+
+def status_raw() -> str:
+    _, out, error = run(["status"], timeout=20)
+    return out or error
+
+
+def parse_status(text: str) -> dict:
+    """Разобрать вывод status в структуру."""
+    st = {
+        "connected": False,
+        "location": None,
+        "mode": None,
+        "iface": None,
+        "warnings": [],
+        "raw": text,
+    }
+    low = text.lower()
+    if "connected to" in low:
+        st["connected"] = True
+        m = re.search(r"Connected to\s+(.+?)\s+in\s+(\S+)\s+mode", text, re.I)
+        if m:
+            st["location"] = m.group(1).strip()
+            st["mode"] = m.group(2).strip().upper()
+        m = re.search(r"running on\s+(\S+)", text, re.I)
+        if m:
+            st["iface"] = m.group(1).strip().rstrip(".")
+        if st["mode"] is None and "socks" in low:
+            st["mode"] = "SOCKS"
+    for line in text.splitlines():
+        s = line.strip()
+        if s.lower().startswith("warning"):
+            st["warnings"].append(s)
+    return st
+
+
+def get_config() -> dict:
+    """config show -> словарь ключ/значение."""
+    _, out, error = run(["config", "show"], timeout=30)
+    cfg: dict[str, str] = {}
+    for line in (out or error).splitlines():
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip().lstrip("\t ")
+        if not key or key.lower().startswith("current configuration"):
+            continue
+        cfg[key] = value.strip()
+    return cfg
+
+
+def get_locations(count: int | None = None) -> list[dict]:
+    """Список локаций: [{iso, country, city, ping}]."""
+    args = ["list-locations"]
+    if count:
+        args.append(str(count))
+    _, out, error = run(args, timeout=60)
+    rows: list[dict] = []
+    for line in (out or error).splitlines():
+        line = line.rstrip()
+        if not line.strip() or line.strip().upper().startswith("ISO"):
+            continue
+        m = re.match(r"^([A-Z]{2})\s{2,}(.+?)\s{2,}(.+?)\s{2,}(\d+)\s*$", line)
+        if m:
+            rows.append(
+                {
+                    "iso": m.group(1),
+                    "country": m.group(2).strip(),
+                    "city": m.group(3).strip(),
+                    "ping": int(m.group(4)),
+                }
+            )
+            continue
+        m = re.match(r"^([A-Z]{2})\s{2,}(.+?)\s{2,}(.+?)\s*$", line)
+        if m:
+            rows.append(
+                {
+                    "iso": m.group(1),
+                    "country": m.group(2).strip(),
+                    "city": m.group(3).strip(),
+                    "ping": None,
+                }
+            )
+    return rows
+
+
+def license_info() -> str:
+    _, out, error = run(["license"], timeout=30)
+    return out or error
+
+
+def iface_traffic(iface: str | None) -> tuple[int, int] | None:
+    """Счётчики rx/tx байт для интерфейса."""
+    if not iface:
+        return None
+    base = Path("/sys/class/net") / iface / "statistics"
+    try:
+        return (
+            int((base / "rx_bytes").read_text().strip()),
+            int((base / "tx_bytes").read_text().strip()),
+        )
+    except (OSError, ValueError):
+        return None
+
+
+def human_bytes(num: int | float) -> str:
+    step = 1024.0
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(num) < step:
+            return f"{num:.0f} {unit}" if unit == "B" else f"{num:.2f} {unit}"
+        num /= step
+    return f"{num:.2f} PiB"
+
+
+def session_uptime() -> str | None:
+    """Время работы VPN-сервиса по pid-файлу."""
+    pid_file = DATA_DIR / "vpn.pid"
+    try:
+        pid = int(pid_file.read_text().strip())
+        started = Path(f"/proc/{pid}").stat().st_ctime
+        delta = timedelta(seconds=int(time.time() - started))
+        return str(delta)
+    except (OSError, ValueError):
+        return None
+
+# --------------------------------------------------------------------------
+# сеть: внешний IP, DNS-утечки
+# --------------------------------------------------------------------------
+
+
+def external_ip(timeout: int = 6) -> dict | None:
+    """Внешний IP через публичные сервисы (только по явному запросу пользователя)."""
+    endpoints = [
+        ("https://ipinfo.io/json", ("ip", "country", "city", "org")),
+        ("https://api.ipify.org?format=json", ("ip",)),
+    ]
+    import urllib.request
+
+    for url, fields in endpoints:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": f"{APP}/{VERSION}"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+            return {k: data.get(k) for k in fields if data.get(k)}
+        except Exception:
+            continue
+    return None
+
+
+def system_dns() -> list[str]:
+    servers: list[str] = []
+    try:
+        for line in Path("/etc/resolv.conf").read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("nameserver"):
+                parts = line.split()
+                if len(parts) > 1:
+                    servers.append(parts[1])
+    except OSError:
+        pass
+    return servers
+
+
+def vpn_dns() -> list[str]:
+    servers: list[str] = []
+    try:
+        for line in (DATA_DIR / "resolv.conf").read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("nameserver"):
+                parts = line.split()
+                if len(parts) > 1:
+                    servers.append(parts[1])
+    except OSError:
+        pass
+    return servers
+
+
+# --------------------------------------------------------------------------
+# вывод: статус, конфиг, локации
+# --------------------------------------------------------------------------
+
+
+def kv(key: str, value: str, width: int = 20) -> None:
+    print(f"  {C.GREY}{key.ljust(width)}{C.RESET} {value}")
+
+
+def show_status(check_ip: bool = False, brief: bool = False) -> dict:
+    st = parse_status(status_raw())
+
+    if brief:
+        if st["connected"]:
+            print(f"{C.GREEN}●{C.RESET} {st['location'] or '?'} [{st['mode'] or '?'}]")
+        else:
+            print(f"{C.RED}○{C.RESET} отключено")
+        return st
+
+    head("Статус AdGuard VPN")
+    if st["connected"]:
+        kv("Состояние", f"{C.GREEN}{C.B}подключено{C.RESET}")
+        kv("Локация", f"{C.B}{st['location'] or '—'}{C.RESET}")
+        kv("Режим", st["mode"] or "—")
+        if st["iface"]:
+            kv("Интерфейс", st["iface"])
+        up = session_uptime()
+        if up:
+            kv("Время сессии", up)
+        traffic = iface_traffic(st["iface"])
+        if traffic:
+            kv("Трафик", f"↓ {human_bytes(traffic[0])}  ↑ {human_bytes(traffic[1])}")
+    else:
+        kv("Состояние", f"{C.RED}отключено{C.RESET}")
+
+    cfg = get_config()
+    if cfg.get("Mode"):
+        kv("Режим в настройках", cfg["Mode"])
+    if cfg.get("Mode", "").lower() == "socks":
+        kv("SOCKS", f"{cfg.get('SOCKS host', '?')}:{cfg.get('SOCKS port', '?')}")
+    if cfg.get("DNS upstream"):
+        kv("DNS upstream", cfg["DNS upstream"])
+
+    lic = license_info()
+    for line in lic.splitlines():
+        low = line.lower()
+        if "logged in as" in low:
+            kv("Аккаунт", line.split("as", 1)[-1].strip())
+        elif "you are using" in low:
+            kv("Подписка", line.replace("You are using the", "").replace("version", "").strip())
+        elif "valid until" in low:
+            kv("Действует до", line.split("until", 1)[-1].strip())
+
+    for w in st["warnings"]:
+        warn(w)
+
+    if check_ip:
+        info("запрашиваю внешний IP…")
+        data = external_ip()
+        if data:
+            place = ", ".join(x for x in (data.get("city"), data.get("country")) if x)
+            kv("Внешний IP", f"{C.B}{data.get('ip', '?')}{C.RESET}" + (f"  ({place})" if place else ""))
+            if data.get("org"):
+                kv("Провайдер", data["org"])
+        else:
+            warn("не удалось определить внешний IP")
+    say()
+    return st
+
+
+def show_config() -> None:
+    head("Настройки AdGuard VPN")
+    cfg = get_config()
+    if not cfg:
+        warn("не удалось прочитать конфигурацию")
+        return
+    width = max((len(k) for k in cfg), default=10)
+    for key, value in cfg.items():
+        kv(key, value or "—", width)
+    say()
+
+
+def show_locations(count: int | None = None, query: str | None = None, favorites_only: bool = False) -> list[dict]:
+    rows = get_locations(count)
+    if not rows:
+        warn("не удалось получить список локаций")
+        return []
+
+    state = load_state()
+    favs = {f.lower() for f in state.get("favorites", [])}
+
+    if favorites_only:
+        rows = [r for r in rows if r["city"].lower() in favs or r["iso"].lower() in favs]
+    if query:
+        q = query.lower()
+        rows = [r for r in rows if q in r["city"].lower() or q in r["country"].lower() or q == r["iso"].lower()]
+
+    head(f"Локации ({len(rows)})")
+    print(f"  {C.GREY}{'#':>3}  {'ISO':<4} {'СТРАНА':<22} {'ГОРОД':<24} {'PING':>5}{C.RESET}")
+    for i, r in enumerate(rows, 1):
+        star = f"{C.YELLOW}★{C.RESET}" if (r["city"].lower() in favs or r["iso"].lower() in favs) else " "
+        ping = r["ping"]
+        if ping is None:
+            ping_s = f"{C.GREY}  —{C.RESET}"
+        elif ping < 60:
+            ping_s = f"{C.GREEN}{ping:>4}{C.RESET}"
+        elif ping < 120:
+            ping_s = f"{C.YELLOW}{ping:>4}{C.RESET}"
+        else:
+            ping_s = f"{C.RED}{ping:>4}{C.RESET}"
+        print(f"  {i:>3}{star} {r['iso']:<4} {r['country'][:22]:<22} {r['city'][:24]:<24} {ping_s} ms")
+    say()
+    return rows
+
+# --------------------------------------------------------------------------
+# действия
+# --------------------------------------------------------------------------
+
+
+def act_connect(location: str | None = None, fastest: bool = False, verbose: bool = False,
+                ipv4: bool = False, ipv6: bool = False, yes: bool = True) -> bool:
+    args = ["connect"]
+    if fastest:
+        args.append("-f")
+    elif location:
+        args += ["-l", location]
+    if ipv4:
+        args.append("-4")
+    if ipv6:
+        args.append("-6")
+    if yes:
+        args.append("-y")
+    if verbose:
+        args.append("-v")
+        return run_live(args) == 0
+
+    target = "самая быстрая локация" if fastest else (location or "последняя локация")
+    info(f"подключаюсь: {target}…")
+    success, text = cli(args, timeout=120)
+    if success:
+        st = parse_status(status_raw())
+        if st["connected"]:
+            ok(f"подключено: {C.B}{st['location']}{C.RESET} [{st['mode']}]")
+            remember(st["location"] or (location or ""))
+        for w in st["warnings"]:
+            warn(w)
+    return success
+
+
+def act_disconnect() -> bool:
+    info("отключаюсь…")
+    success, _ = cli(["disconnect"], timeout=60)
+    return success
+
+
+def act_reconnect() -> bool:
+    st = parse_status(status_raw())
+    location = st["location"] if st["connected"] else None
+    if st["connected"]:
+        act_disconnect()
+        time.sleep(1.5)
+    return act_connect(location=location)
+
+
+def act_toggle() -> bool:
+    st = parse_status(status_raw())
+    return act_disconnect() if st["connected"] else act_connect()
+
+
+def act_login() -> bool:
+    head("Вход в аккаунт AdGuard")
+    return run_live(["login"]) == 0
+
+
+def act_logout() -> bool:
+    return cli(["logout"], timeout=60)[0]
+
+
+def act_update(check_only: bool = False) -> bool:
+    if check_only:
+        head("Проверка обновлений")
+        return cli(["check-update"], timeout=60)[0]
+    head("Обновление AdGuard VPN CLI")
+    return run_live(["update", "-v"]) == 0
+
+
+def act_export_logs(output: str | None = None) -> bool:
+    args = ["export-logs", "-f"]
+    if output:
+        args += ["-o", os.path.expanduser(output)]
+    return cli(args, timeout=120)[0]
+
+
+def act_logs(lines: int = 40, follow: bool = False, tunnel: bool = False) -> None:
+    log_file = DATA_DIR / ("tunnel.log" if tunnel else "app.log")
+    if not log_file.exists():
+        warn(f"файл лога не найден: {log_file}")
+        return
+    head(f"Лог: {log_file.name}")
+    if follow:
+        say(f"{C.GREY}Ctrl+C — выход{C.RESET}\n")
+        try:
+            subprocess.call(["tail", "-n", str(lines), "-f", str(log_file)])
+        except KeyboardInterrupt:
+            say()
+        return
+    try:
+        content = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        err(f"не удалось прочитать лог: {exc}")
+        return
+    for line in content[-lines:]:
+        low = line.lower()
+        if "error" in low or "fatal" in low:
+            print(f"{C.RED}{line}{C.RESET}")
+        elif "warn" in low:
+            print(f"{C.YELLOW}{line}{C.RESET}")
+        else:
+            print(line)
+    say()
+
+
+def act_leak_check() -> None:
+    """Проверка: активен ли туннель, куда идут DNS, какой внешний IP."""
+    head("Проверка утечек")
+    st = parse_status(status_raw())
+    if not st["connected"]:
+        warn("VPN отключён — весь трафик идёт напрямую")
+    else:
+        ok(f"туннель активен: {st['location']} [{st['mode']}]")
+
+    traffic = iface_traffic(st["iface"])
+    if st["iface"]:
+        if traffic:
+            ok(f"интерфейс {st['iface']} живой: ↓ {human_bytes(traffic[0])} ↑ {human_bytes(traffic[1])}")
+        else:
+            warn(f"интерфейс {st['iface']} не найден в /sys/class/net")
+
+    sys_dns = system_dns()
+    tun_dns = vpn_dns()
+    kv("Системный DNS", ", ".join(sys_dns) or "—", 18)
+    kv("DNS от VPN", ", ".join(tun_dns) or "—", 18)
+    if st["connected"] and tun_dns and sys_dns and not set(tun_dns) & set(sys_dns):
+        warn("системный DNS не совпадает с DNS туннеля — возможна утечка DNS")
+        say(f"  {C.GREY}починить: sudo ln -sf {DATA_DIR / 'resolv.conf'} /etc/resolv.conf{C.RESET}")
+    elif st["connected"] and set(tun_dns) & set(sys_dns):
+        ok("DNS направлен в туннель")
+
+    info("запрашиваю внешний IP…")
+    data = external_ip()
+    if data:
+        place = ", ".join(x for x in (data.get("city"), data.get("country")) if x)
+        kv("Внешний IP", f"{data.get('ip', '?')}  {place}", 18)
+        if st["connected"] and st["location"] and place:
+            city = st["location"].split(",")[0].strip().lower()
+            if city and city in place.lower():
+                ok("внешний IP соответствует локации VPN")
+            else:
+                warn("внешний IP не совпадает с городом локации (может быть нормой для некоторых серверов)")
+    else:
+        warn("не удалось определить внешний IP")
+    say()
+
+
+def act_watch(interval: int = 3) -> None:
+    """Живой мониторинг статуса и трафика."""
+    st = parse_status(status_raw())
+    iface = st["iface"]
+    prev = iface_traffic(iface)
+    prev_time = time.time()
+    say(f"{C.GREY}Ctrl+C — выход{C.RESET}")
+    try:
+        while True:
+            st = parse_status(status_raw())
+            if st["iface"] != iface:
+                iface = st["iface"]
+                prev = iface_traffic(iface)
+                prev_time = time.time()
+            now = iface_traffic(iface)
+            speed = ""
+            if prev and now:
+                dt = max(time.time() - prev_time, 0.001)
+                down = (now[0] - prev[0]) / dt
+                up = (now[1] - prev[1]) / dt
+                speed = f"  ↓ {human_bytes(down)}/s  ↑ {human_bytes(up)}/s"
+            prev, prev_time = now, time.time()
+
+            stamp = datetime.now().strftime("%H:%M:%S")
+            if st["connected"]:
+                total = f"  всего ↓ {human_bytes(now[0])} ↑ {human_bytes(now[1])}" if now else ""
+                line = (f"{C.GREEN}●{C.RESET} {st['location']} [{st['mode']}] "
+                        f"{st['iface'] or ''}{speed}{total}")
+            else:
+                line = f"{C.RED}○{C.RESET} отключено"
+            print(f"\r\033[2K{C.GREY}{stamp}{C.RESET} {line}", end="", flush=True)
+            time.sleep(max(interval, 1))
+    except KeyboardInterrupt:
+        say("\n")
+
+# --------------------------------------------------------------------------
+# настройки
+# --------------------------------------------------------------------------
+
+BOOL_KEYS = {
+    "system-dns": "set-change-system-dns",
+    "post-quantum": "set-post-quantum",
+    "crash-reports": "set-crash-reporting",
+    "telemetry": "set-telemetry",
+    "hints": "set-show-hints",
+    "debug": "set-debug-logging",
+    "notifications": "set-show-notifications",
+}
+
+
+def act_set(key: str, value: str) -> bool:
+    """Единая точка установки любой настройки по короткому имени."""
+    key = key.lower().replace("_", "-")
+    value = value.strip()
+
+    if key in BOOL_KEYS:
+        v = value.lower()
+        if v in ("on", "true", "1", "yes", "да", "вкл"):
+            v = "on"
+        elif v in ("off", "false", "0", "no", "нет", "выкл"):
+            v = "off"
+        else:
+            err("значение должно быть on или off")
+            return False
+        return cli(["config", BOOL_KEYS[key], v])[0]
+
+    if key == "mode":
+        v = value.lower()
+        if v not in ("tun", "socks"):
+            err("режим: tun или socks")
+            return False
+        return cli(["config", "set-mode", v])[0]
+
+    if key == "dns":
+        return cli(["config", "set-dns", value or "default"])[0]
+
+    if key == "socks-port":
+        if not value.isdigit() or not (1 <= int(value) <= 65535):
+            err("порт: число 1–65535")
+            return False
+        return cli(["config", "set-socks-port", value])[0]
+
+    if key == "socks-host":
+        return cli(["config", "set-socks-host", value])[0]
+
+    if key == "socks-user":
+        return cli(["config", "set-socks-username", value])[0]
+
+    if key == "socks-pass":
+        return cli(["config", "set-socks-password", value])[0]
+
+    if key == "routing":
+        v = value.lower()
+        if v not in ("auto", "script", "none"):
+            err("маршрутизация: auto, script или none")
+            return False
+        return cli(["config", "set-tun-routing-mode", v])[0]
+
+    if key == "protocol":
+        v = value.lower()
+        if v not in ("auto", "http2", "quic"):
+            err("протокол: auto, http2 или quic")
+            return False
+        return cli(["config", "set-protocol", v])[0]
+
+    if key == "channel":
+        v = value.lower()
+        if v not in ("release", "beta", "nightly"):
+            err("канал: release, beta или nightly")
+            return False
+        return cli(["config", "set-update-channel", v])[0]
+
+    if key in ("interface", "bound-if"):
+        return cli(["config", "set-bound-if-override", value])[0]
+
+    err(f"неизвестная настройка: {key}")
+    say(f"{C.GREY}доступно: mode, dns, socks-port, socks-host, socks-user, socks-pass, "
+        f"routing, protocol, channel, interface, {', '.join(BOOL_KEYS)}{C.RESET}")
+    return False
+
+
+def act_socks_clear_auth() -> bool:
+    return cli(["config", "clear-socks-auth"])[0]
+
+
+def act_route_script() -> bool:
+    return cli(["config", "create-route-script"], timeout=60)[0]
+
+
+# --------------------------------------------------------------------------
+# исключения сайтов
+# --------------------------------------------------------------------------
+
+
+def act_excl_show(for_mode: str | None = None) -> None:
+    args = ["site-exclusions", "show"]
+    if for_mode:
+        args += ["--for-mode", for_mode]
+    _, out, error = run(args, timeout=30)
+    text = out or error
+    head("Исключения сайтов")
+    _, mode_out, _ = run(["site-exclusions", "mode"], timeout=20)
+    if mode_out:
+        kv("Режим", mode_out.replace("Current exclusion mode is", "").strip(), 10)
+    items = [l.strip() for l in text.splitlines()[1:] if l.strip()]
+    if items:
+        for item in items:
+            print(f"  · {item}")
+    else:
+        say(f"  {C.GREY}список пуст{C.RESET}")
+    say(f"\n  {C.GREY}general — VPN везде, кроме списка; selective — VPN только для списка{C.RESET}\n")
+
+
+def act_excl_add(domains: list[str], for_mode: str | None = None) -> bool:
+    if not domains:
+        err("укажите хотя бы один домен")
+        return False
+    args = ["site-exclusions", "add", *domains]
+    if for_mode:
+        args += ["--for-mode", for_mode]
+    return cli(args, timeout=30)[0]
+
+
+def act_excl_remove(domains: list[str], for_mode: str | None = None) -> bool:
+    if not domains:
+        err("укажите хотя бы один домен")
+        return False
+    args = ["site-exclusions", "remove", *domains]
+    if for_mode:
+        args += ["--for-mode", for_mode]
+    return cli(args, timeout=30)[0]
+
+
+def act_excl_clear(for_mode: str | None = None, assume_yes: bool = False) -> bool:
+    if not assume_yes and not confirm("Очистить все исключения?"):
+        return False
+    args = ["site-exclusions", "clear"]
+    if for_mode:
+        args += ["--for-mode", for_mode]
+    return cli(args, timeout=30)[0]
+
+
+def act_excl_mode(value: str | None = None) -> bool:
+    args = ["site-exclusions", "mode"]
+    if value:
+        v = value.lower()
+        if v not in ("general", "selective"):
+            err("режим: general или selective")
+            return False
+        args.append(v)
+    return cli(args, timeout=30)[0]
+
+
+# --------------------------------------------------------------------------
+# избранное и профили
+# --------------------------------------------------------------------------
+
+
+def act_fav_add(names: list[str]) -> None:
+    state = load_state()
+    favs = state.setdefault("favorites", [])
+    for name in names:
+        if name and name.lower() not in {f.lower() for f in favs}:
+            favs.append(name)
+            ok(f"в избранное: {name}")
+        else:
+            warn(f"уже в избранном: {name}")
+    save_state(state)
+
+
+def act_fav_remove(names: list[str]) -> None:
+    state = load_state()
+    favs = state.setdefault("favorites", [])
+    lower = {n.lower() for n in names}
+    kept = [f for f in favs if f.lower() not in lower]
+    removed = len(favs) - len(kept)
+    state["favorites"] = kept
+    save_state(state)
+    ok(f"удалено из избранного: {removed}") if removed else warn("ничего не удалено")
+
+
+def act_fav_list() -> None:
+    state = load_state()
+    head("Избранные локации")
+    favs = state.get("favorites", [])
+    if favs:
+        for i, f in enumerate(favs, 1):
+            print(f"  {i:>2}. {C.YELLOW}★{C.RESET} {f}")
+    else:
+        say(f"  {C.GREY}пусто — добавьте: {APP} fav add Riga{C.RESET}")
+    hist = state.get("history", [])
+    if hist:
+        say(f"\n  {C.GREY}Недавние: {', '.join(hist[:5])}{C.RESET}")
+    say()
+
+
+PROFILE_KEYS = ("mode", "dns", "socks-port", "socks-host", "routing", "protocol",
+                "post-quantum", "system-dns", "notifications")
+
+
+def act_profile_save(name: str) -> None:
+    cfg = get_config()
+    snapshot = {
+        "mode": cfg.get("Mode", ""),
+        "dns": cfg.get("DNS upstream", ""),
+        "socks-port": cfg.get("SOCKS port", ""),
+        "socks-host": cfg.get("SOCKS host", ""),
+        "routing": cfg.get("Tunnel routing mode", ""),
+        "protocol": cfg.get("Protocol", ""),
+        "post-quantum": cfg.get("Post-quantum cryptography", ""),
+        "system-dns": cfg.get("Change system DNS", ""),
+        "notifications": cfg.get("Show notifications", ""),
+    }
+    state = load_state()
+    state.setdefault("profiles", {})[name] = snapshot
+    save_state(state)
+    ok(f"профиль «{name}» сохранён")
+
+
+def _clean(value: str) -> str:
+    """Нормализовать значение из config show ('Default (auto)' -> 'auto')."""
+    v = (value or "").strip()
+    m = re.match(r"^Default \((.+)\)$", v)
+    if m:
+        v = m.group(1)
+    if v.lower().startswith("default"):
+        return "default"
+    return v.strip()
+
+
+def act_profile_apply(name: str) -> bool:
+    state = load_state()
+    prof = state.get("profiles", {}).get(name)
+    if not prof:
+        err(f"профиль «{name}» не найден")
+        return False
+    head(f"Применяю профиль «{name}»")
+    applied = 0
+    for key in PROFILE_KEYS:
+        raw = _clean(prof.get(key, ""))
+        if not raw:
+            continue
+        if key == "dns" and raw.lower() in ("default", "default (provided by adguard vpn)"):
+            raw = "default"
+        if key in ("post-quantum", "system-dns", "notifications"):
+            raw = "on" if raw.lower().startswith("on") else "off"
+        if key == "mode":
+            raw = raw.lower()
+        if act_set(key, raw):
+            applied += 1
+    ok(f"применено настроек: {applied}")
+    return True
+
+
+def act_profile_list() -> None:
+    state = load_state()
+    head("Профили настроек")
+    profiles = state.get("profiles", {})
+    if not profiles:
+        say(f"  {C.GREY}пусто — сохраните текущие настройки: {APP} profile save work{C.RESET}\n")
+        return
+    for name, prof in profiles.items():
+        print(f"  {C.B}{name}{C.RESET}")
+        for key, value in prof.items():
+            if value:
+                print(f"    {C.GREY}{key:<14}{C.RESET} {value}")
+    say()
+
+
+def act_profile_delete(name: str) -> None:
+    state = load_state()
+    if state.get("profiles", {}).pop(name, None) is None:
+        err(f"профиль «{name}» не найден")
+        return
+    save_state(state)
+    ok(f"профиль «{name}» удалён")
+
+# --------------------------------------------------------------------------
+# интерактивное меню
+# --------------------------------------------------------------------------
+
+
+def ask(prompt: str, default: str = "") -> str:
+    suffix = f" {C.GREY}[{default}]{C.RESET}" if default else ""
+    try:
+        answer = input(f"{C.CYAN}?{C.RESET} {prompt}{suffix}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        say()
+        return ""
+    return answer or default
+
+
+def confirm(prompt: str, default: bool = False) -> bool:
+    hint = "Y/n" if default else "y/N"
+    try:
+        answer = input(f"{C.YELLOW}?{C.RESET} {prompt} {C.GREY}[{hint}]{C.RESET}: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        say()
+        return False
+    if not answer:
+        return default
+    return answer in ("y", "yes", "д", "да")
+
+
+def pause() -> None:
+    try:
+        input(f"\n{C.GREY}Enter — продолжить…{C.RESET}")
+    except (EOFError, KeyboardInterrupt):
+        say()
+
+
+def clear_screen() -> None:
+    if sys.stdout.isatty():
+        print("\033[H\033[2J", end="")
+
+
+def pick_location() -> str | None:
+    """Выбрать локацию: избранное, поиск, номер из списка."""
+    state = load_state()
+    favs = state.get("favorites", [])
+    hist = state.get("history", [])
+
+    head("Выбор локации")
+    shortcuts: list[str] = []
+    if favs:
+        say(f"  {C.B}Избранное{C.RESET}")
+        for f in favs:
+            shortcuts.append(f)
+            print(f"  {len(shortcuts):>3}. {C.YELLOW}★{C.RESET} {f}")
+    if hist:
+        say(f"  {C.B}Недавние{C.RESET}")
+        for h in hist[:5]:
+            if h.lower() in {s.lower() for s in shortcuts}:
+                continue
+            shortcuts.append(h)
+            print(f"  {len(shortcuts):>3}. {C.GREY}⟲{C.RESET} {h}")
+
+    say(f"\n  {C.GREY}Введите номер, название города/страны/ISO,")
+    say(f"  «l» — весь список, «f» — самая быстрая, пусто — отмена{C.RESET}\n")
+
+    answer = ask("Локация")
+    if not answer:
+        return None
+    if answer.lower() == "f":
+        return "__FASTEST__"
+    if answer.lower() == "l":
+        rows = show_locations()
+        if not rows:
+            return None
+        choice = ask("Номер локации")
+        if choice.isdigit() and 1 <= int(choice) <= len(rows):
+            return rows[int(choice) - 1]["city"]
+        return choice or None
+    if answer.isdigit():
+        idx = int(answer)
+        if 1 <= idx <= len(shortcuts):
+            return shortcuts[idx - 1]
+        warn("нет такого номера")
+        return None
+    return answer
+
+
+def menu_connect() -> None:
+    target = pick_location()
+    if not target:
+        return
+    if target == "__FASTEST__":
+        act_connect(fastest=True)
+    else:
+        act_connect(location=target)
+
+
+def menu_settings() -> None:
+    while True:
+        clear_screen()
+        show_config()
+        say(f"  {C.B}1{C.RESET} режим TUN/SOCKS         {C.B}6{C.RESET} протокол (auto/http2/quic)")
+        say(f"  {C.B}2{C.RESET} DNS upstream            {C.B}7{C.RESET} постквантовое шифрование")
+        say(f"  {C.B}3{C.RESET} SOCKS порт/хост         {C.B}8{C.RESET} системный DNS вкл/выкл")
+        say(f"  {C.B}4{C.RESET} маршрутизация TUN       {C.B}9{C.RESET} уведомления вкл/выкл")
+        say(f"  {C.B}5{C.RESET} канал обновлений        {C.B}10{C.RESET} отладочный лог вкл/выкл")
+        say(f"  {C.B}11{C.RESET} скрипт маршрутизации   {C.B}12{C.RESET} сбросить SOCKS-логин/пароль")
+        say(f"  {C.B}13{C.RESET} телеметрия и отчёты о сбоях")
+        say(f"\n  {C.B}0{C.RESET} назад")
+        choice = ask("Выбор")
+
+        if choice in ("0", ""):
+            return
+        if choice == "1":
+            act_set("mode", ask("Режим (tun/socks)", "tun"))
+        elif choice == "2":
+            say(f"  {C.GREY}примеры: default, 94.140.14.14, tls://dns.adguard-dns.com{C.RESET}")
+            act_set("dns", ask("DNS upstream", "default"))
+        elif choice == "3":
+            act_set("socks-port", ask("SOCKS порт", "1080"))
+            host = ask("SOCKS хост (пусто — не менять)", "")
+            if host:
+                act_set("socks-host", host)
+                if host not in ("127.0.0.1", "localhost"):
+                    warn("для нелокального хоста нужны логин и пароль")
+                    user = ask("SOCKS логин")
+                    if user:
+                        act_set("socks-user", user)
+                        pwd = ask("SOCKS пароль")
+                        if pwd:
+                            act_set("socks-pass", pwd)
+        elif choice == "4":
+            act_set("routing", ask("Маршрутизация (auto/script/none)", "auto"))
+        elif choice == "5":
+            act_set("channel", ask("Канал (release/beta/nightly)", "release"))
+        elif choice == "6":
+            act_set("protocol", ask("Протокол (auto/http2/quic)", "auto"))
+        elif choice == "7":
+            act_set("post-quantum", ask("Постквантовое шифрование (on/off)", "on"))
+        elif choice == "8":
+            act_set("system-dns", ask("Менять системный DNS (on/off)", "on"))
+        elif choice == "9":
+            act_set("notifications", ask("Уведомления (on/off)", "off"))
+        elif choice == "10":
+            act_set("debug", ask("Отладочный лог (on/off)", "off"))
+        elif choice == "11":
+            act_route_script()
+        elif choice == "12":
+            act_socks_clear_auth()
+        elif choice == "13":
+            act_set("telemetry", ask("Телеметрия (on/off)", "off"))
+            act_set("crash-reports", ask("Отчёты о сбоях (on/off)", "off"))
+        else:
+            warn("неизвестный пункт")
+        pause()
+
+
+def menu_exclusions() -> None:
+    while True:
+        clear_screen()
+        act_excl_show()
+        say(f"  {C.B}1{C.RESET} добавить домены      {C.B}4{C.RESET} сменить режим (general/selective)")
+        say(f"  {C.B}2{C.RESET} удалить домены       {C.B}5{C.RESET} показать список другого режима")
+        say(f"  {C.B}3{C.RESET} очистить список")
+        say(f"\n  {C.B}0{C.RESET} назад")
+        choice = ask("Выбор")
+        if choice in ("0", ""):
+            return
+        if choice == "1":
+            raw = ask("Домены через пробел (например: bank.ru *.gov.ru)")
+            if raw:
+                act_excl_add(raw.split())
+        elif choice == "2":
+            raw = ask("Домены через пробел")
+            if raw:
+                act_excl_remove(raw.split())
+        elif choice == "3":
+            act_excl_clear()
+        elif choice == "4":
+            act_excl_mode(ask("Режим (general/selective)", "general"))
+        elif choice == "5":
+            act_excl_show(ask("Показать режим (general/selective)", "selective"))
+        else:
+            warn("неизвестный пункт")
+        pause()
+
+
+def menu_favorites() -> None:
+    while True:
+        clear_screen()
+        act_fav_list()
+        say(f"  {C.B}1{C.RESET} добавить      {C.B}2{C.RESET} удалить      {C.B}3{C.RESET} подключиться к избранной")
+        say(f"\n  {C.B}0{C.RESET} назад")
+        choice = ask("Выбор")
+        if choice in ("0", ""):
+            return
+        if choice == "1":
+            raw = ask("Локации через пробел (Riga Amsterdam DE)")
+            if raw:
+                act_fav_add(raw.split())
+        elif choice == "2":
+            raw = ask("Локации через пробел")
+            if raw:
+                act_fav_remove(raw.split())
+        elif choice == "3":
+            favs = load_state().get("favorites", [])
+            if not favs:
+                warn("избранное пусто")
+            else:
+                num = ask(f"Номер (1–{len(favs)})")
+                if num.isdigit() and 1 <= int(num) <= len(favs):
+                    act_connect(location=favs[int(num) - 1])
+        pause()
+
+
+def menu_profiles() -> None:
+    while True:
+        clear_screen()
+        act_profile_list()
+        say(f"  {C.B}1{C.RESET} сохранить текущие настройки   {C.B}2{C.RESET} применить профиль   {C.B}3{C.RESET} удалить")
+        say(f"\n  {C.B}0{C.RESET} назад")
+        choice = ask("Выбор")
+        if choice in ("0", ""):
+            return
+        if choice == "1":
+            name = ask("Имя профиля")
+            if name:
+                act_profile_save(name)
+        elif choice == "2":
+            name = ask("Имя профиля")
+            if name:
+                act_profile_apply(name)
+        elif choice == "3":
+            name = ask("Имя профиля")
+            if name:
+                act_profile_delete(name)
+        pause()
+
+
+def menu_tools() -> None:
+    while True:
+        clear_screen()
+        head("Диагностика и обслуживание")
+        say(f"  {C.B}1{C.RESET} проверка утечек DNS/IP      {C.B}5{C.RESET} проверить обновления")
+        say(f"  {C.B}2{C.RESET} мониторинг трафика (watch)  {C.B}6{C.RESET} обновить программу")
+        say(f"  {C.B}3{C.RESET} лог приложения              {C.B}7{C.RESET} экспорт логов в zip")
+        say(f"  {C.B}4{C.RESET} лог туннеля                 {C.B}8{C.RESET} лицензия и аккаунт")
+        say(f"\n  {C.B}0{C.RESET} назад")
+        choice = ask("Выбор")
+        if choice in ("0", ""):
+            return
+        if choice == "1":
+            act_leak_check()
+        elif choice == "2":
+            act_watch()
+        elif choice == "3":
+            act_logs(60)
+        elif choice == "4":
+            act_logs(60, tunnel=True)
+        elif choice == "5":
+            act_update(check_only=True)
+        elif choice == "6":
+            act_update()
+        elif choice == "7":
+            act_export_logs(ask("Путь для сохранения", str(Path.home())))
+        elif choice == "8":
+            head("Лицензия")
+            say(license_info())
+            say()
+        pause()
+
+
+def menu_account() -> None:
+    clear_screen()
+    head("Аккаунт")
+    say(license_info() or "нет данных")
+    say(f"\n  {C.B}1{C.RESET} войти      {C.B}2{C.RESET} выйти из аккаунта")
+    say(f"\n  {C.B}0{C.RESET} назад")
+    choice = ask("Выбор")
+    if choice == "1":
+        act_login()
+        pause()
+    elif choice == "2":
+        if confirm("Выйти из аккаунта? VPN будет отключён"):
+            act_logout()
+        pause()
+
+
+def main_menu() -> None:
+    while True:
+        clear_screen()
+        st = show_status()
+
+        toggle = f"{C.RED}отключиться{C.RESET}" if st["connected"] else f"{C.GREEN}подключиться{C.RESET}"
+        say(f"  {C.B}1{C.RESET} {toggle} (быстро)      {C.B}6{C.RESET} исключения сайтов")
+        say(f"  {C.B}2{C.RESET} подключиться к локации…    {C.B}7{C.RESET} избранное")
+        say(f"  {C.B}3{C.RESET} самая быстрая локация      {C.B}8{C.RESET} профили настроек")
+        say(f"  {C.B}4{C.RESET} список локаций и пинги     {C.B}9{C.RESET} диагностика и логи")
+        say(f"  {C.B}5{C.RESET} настройки                 {C.B}10{C.RESET} аккаунт и лицензия")
+        say(f"\n  {C.B}r{C.RESET} переподключиться   {C.B}i{C.RESET} внешний IP   {C.B}w{C.RESET} мониторинг   {C.B}q{C.RESET} выход")
+
+        choice = ask("Выбор").lower()
+
+        if choice in ("q", "0", "exit", "quit"):
+            say("Пока.")
+            return
+        if choice == "":
+            continue
+        if choice == "1":
+            act_toggle()
+            pause()
+        elif choice == "2":
+            menu_connect()
+            pause()
+        elif choice == "3":
+            act_connect(fastest=True)
+            pause()
+        elif choice == "4":
+            query = ask("Фильтр (пусто — все)")
+            show_locations(query=query or None)
+            pause()
+        elif choice == "5":
+            menu_settings()
+        elif choice == "6":
+            menu_exclusions()
+        elif choice == "7":
+            menu_favorites()
+        elif choice == "8":
+            menu_profiles()
+        elif choice == "9":
+            menu_tools()
+        elif choice == "10":
+            menu_account()
+        elif choice == "r":
+            act_reconnect()
+            pause()
+        elif choice == "i":
+            show_status(check_ip=True)
+            pause()
+        elif choice == "w":
+            act_watch()
+        else:
+            warn("неизвестный пункт")
+            pause()
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+EPILOG = f"""
+примеры:
+  {APP}                        интерактивное меню
+  {APP} on                     подключиться (последняя локация)
+  {APP} on Riga                подключиться к локации
+  {APP} fast                   самая быстрая локация
+  {APP} off                    отключиться
+  {APP} st                     краткий статус
+  {APP} ls -q germ             найти локации по подстроке
+  {APP} set dns default        изменить настройку
+  {APP} excl add bank.ru       добавить исключение
+  {APP} check                  проверка утечек DNS/IP
+  {APP} watch                  мониторинг трафика
+"""
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=APP,
+        description="Удобная оболочка над AdGuard VPN CLI",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("-V", "--version", action="version", version=f"{APP} {VERSION}")
+    sub = p.add_subparsers(dest="cmd")
+
+    c = sub.add_parser("connect", aliases=["on", "c"], help="подключиться к VPN")
+    c.add_argument("location", nargs="?", help="город, страна или ISO-код")
+    c.add_argument("-f", "--fastest", action="store_true", help="самая быстрая локация")
+    c.add_argument("-v", "--verbose", action="store_true", help="показать лог сервиса")
+    c.add_argument("-4", "--ipv4", action="store_true", help="только IPv4")
+    c.add_argument("-6", "--ipv6", action="store_true", help="только IPv6")
+
+    sub.add_parser("disconnect", aliases=["off", "d"], help="отключиться")
+    sub.add_parser("fast", aliases=["f"], help="подключиться к самой быстрой локации")
+    sub.add_parser("reconnect", aliases=["r"], help="переподключиться")
+    sub.add_parser("toggle", aliases=["t"], help="переключить подключение")
+
+    s = sub.add_parser("status", aliases=["st", "s"], help="статус подключения")
+    s.add_argument("-i", "--ip", action="store_true", help="показать внешний IP")
+    s.add_argument("-b", "--brief", action="store_true", help="одна строка (для панелей)")
+    s.add_argument("--json", action="store_true", help="вывод в JSON")
+
+    l = sub.add_parser("locations", aliases=["ls", "l"], help="список локаций")
+    l.add_argument("count", nargs="?", type=int, help="сколько показать (по пингу)")
+    l.add_argument("-q", "--query", help="фильтр по городу/стране/ISO")
+    l.add_argument("--fav", action="store_true", help="только избранные")
+    l.add_argument("--json", action="store_true", help="вывод в JSON")
+
+    cfg = sub.add_parser("config", aliases=["cfg"], help="показать настройки")
+    cfg.add_argument("--json", action="store_true", help="вывод в JSON")
+
+    setp = sub.add_parser("set", help="изменить настройку")
+    setp.add_argument("key", help="mode, dns, socks-port, routing, protocol, channel и др.")
+    setp.add_argument("value", nargs="?", default="", help="значение")
+
+    e = sub.add_parser("exclusions", aliases=["excl", "e"], help="исключения сайтов")
+    esub = e.add_subparsers(dest="esub")
+    ea = esub.add_parser("add", help="добавить домены")
+    ea.add_argument("domains", nargs="+")
+    ea.add_argument("--for-mode", choices=["general", "selective"])
+    er = esub.add_parser("remove", aliases=["rm"], help="удалить домены")
+    er.add_argument("domains", nargs="+")
+    er.add_argument("--for-mode", choices=["general", "selective"])
+    es = esub.add_parser("show", aliases=["ls"], help="показать список")
+    es.add_argument("--for-mode", choices=["general", "selective"])
+    ec = esub.add_parser("clear", help="очистить список")
+    ec.add_argument("--for-mode", choices=["general", "selective"])
+    ec.add_argument("-y", "--yes", action="store_true", help="без подтверждения")
+    em = esub.add_parser("mode", help="режим general/selective")
+    em.add_argument("value", nargs="?", choices=["general", "selective"])
+
+    fav = sub.add_parser("fav", help="избранные локации")
+    fsub = fav.add_subparsers(dest="fsub")
+    fa = fsub.add_parser("add", help="добавить в избранное")
+    fa.add_argument("names", nargs="+")
+    fr = fsub.add_parser("remove", aliases=["rm"], help="убрать из избранного")
+    fr.add_argument("names", nargs="+")
+    fsub.add_parser("list", aliases=["ls"], help="показать избранное")
+
+    prof = sub.add_parser("profile", aliases=["prof"], help="профили настроек")
+    psub = prof.add_subparsers(dest="psub")
+    ps = psub.add_parser("save", help="сохранить текущие настройки")
+    ps.add_argument("name")
+    pa = psub.add_parser("apply", help="применить профиль")
+    pa.add_argument("name")
+    pd = psub.add_parser("delete", aliases=["rm"], help="удалить профиль")
+    pd.add_argument("name")
+    psub.add_parser("list", aliases=["ls"], help="показать профили")
+
+    sub.add_parser("check", help="проверка утечек DNS/IP")
+    sub.add_parser("ip", help="показать внешний IP")
+
+    w = sub.add_parser("watch", aliases=["w"], help="мониторинг трафика")
+    w.add_argument("-n", "--interval", type=int, default=3, help="интервал в секундах")
+
+    lg = sub.add_parser("logs", help="показать логи")
+    lg.add_argument("-n", "--lines", type=int, default=40, help="сколько строк")
+    lg.add_argument("-f", "--follow", action="store_true", help="следить за новыми записями")
+    lg.add_argument("-t", "--tunnel", action="store_true", help="лог туннеля вместо app.log")
+
+    ex = sub.add_parser("export-logs", help="экспорт логов в zip")
+    ex.add_argument("-o", "--output", help="путь сохранения")
+
+    sub.add_parser("login", help="вход в аккаунт")
+    sub.add_parser("logout", help="выход из аккаунта")
+    sub.add_parser("license", aliases=["lic"], help="лицензия и аккаунт")
+
+    up = sub.add_parser("update", help="обновить AdGuard VPN CLI")
+    up.add_argument("-c", "--check", action="store_true", help="только проверить наличие обновлений")
+
+    sub.add_parser("menu", aliases=["ui"], help="интерактивное меню")
+
+    raw = sub.add_parser("raw", help="передать аргументы напрямую в adguardvpn-cli")
+    raw.add_argument("args", nargs=argparse.REMAINDER)
+
+    return p
+
+
+def dispatch(a: argparse.Namespace) -> int:
+    cmd = a.cmd
+
+    if cmd in ("connect", "on", "c"):
+        return 0 if act_connect(location=a.location, fastest=a.fastest, verbose=a.verbose,
+                                ipv4=a.ipv4, ipv6=a.ipv6) else 1
+    if cmd in ("disconnect", "off", "d"):
+        return 0 if act_disconnect() else 1
+    if cmd in ("fast", "f"):
+        return 0 if act_connect(fastest=True) else 1
+    if cmd in ("reconnect", "r"):
+        return 0 if act_reconnect() else 1
+    if cmd in ("toggle", "t"):
+        return 0 if act_toggle() else 1
+
+    if cmd in ("status", "st", "s"):
+        if a.json:
+            st = parse_status(status_raw())
+            st["config"] = get_config()
+            st["uptime"] = session_uptime()
+            traffic = iface_traffic(st["iface"])
+            if traffic:
+                st["rx_bytes"], st["tx_bytes"] = traffic
+            print(json.dumps(st, ensure_ascii=False, indent=2))
+            return 0 if st["connected"] else 1
+        st = show_status(check_ip=a.ip, brief=a.brief)
+        return 0 if st["connected"] else 1
+
+    if cmd in ("locations", "ls", "l"):
+        if a.json:
+            print(json.dumps(get_locations(a.count), ensure_ascii=False, indent=2))
+            return 0
+        show_locations(count=a.count, query=a.query, favorites_only=a.fav)
+        return 0
+
+    if cmd in ("config", "cfg"):
+        if a.json:
+            print(json.dumps(get_config(), ensure_ascii=False, indent=2))
+        else:
+            show_config()
+        return 0
+
+    if cmd == "set":
+        return 0 if act_set(a.key, a.value) else 1
+
+    if cmd in ("exclusions", "excl", "e"):
+        mode = getattr(a, "for_mode", None)
+        if a.esub == "add":
+            return 0 if act_excl_add(a.domains, mode) else 1
+        if a.esub in ("remove", "rm"):
+            return 0 if act_excl_remove(a.domains, mode) else 1
+        if a.esub == "clear":
+            return 0 if act_excl_clear(mode, a.yes) else 1
+        if a.esub == "mode":
+            return 0 if act_excl_mode(a.value) else 1
+        act_excl_show(mode)
+        return 0
+
+    if cmd == "fav":
+        if a.fsub == "add":
+            act_fav_add(a.names)
+        elif a.fsub in ("remove", "rm"):
+            act_fav_remove(a.names)
+        else:
+            act_fav_list()
+        return 0
+
+    if cmd in ("profile", "prof"):
+        if a.psub == "save":
+            act_profile_save(a.name)
+        elif a.psub == "apply":
+            return 0 if act_profile_apply(a.name) else 1
+        elif a.psub in ("delete", "rm"):
+            act_profile_delete(a.name)
+        else:
+            act_profile_list()
+        return 0
+
+    if cmd == "check":
+        act_leak_check()
+        return 0
+
+    if cmd == "ip":
+        data = external_ip()
+        if not data:
+            err("не удалось определить внешний IP")
+            return 1
+        place = ", ".join(x for x in (data.get("city"), data.get("country")) if x)
+        say(f"{C.B}{data.get('ip')}{C.RESET}" + (f"  {C.GREY}{place}{C.RESET}" if place else ""))
+        if data.get("org"):
+            say(f"{C.GREY}{data['org']}{C.RESET}")
+        return 0
+
+    if cmd in ("watch", "w"):
+        act_watch(a.interval)
+        return 0
+
+    if cmd == "logs":
+        act_logs(a.lines, a.follow, a.tunnel)
+        return 0
+
+    if cmd == "export-logs":
+        return 0 if act_export_logs(a.output) else 1
+
+    if cmd == "login":
+        return 0 if act_login() else 1
+    if cmd == "logout":
+        return 0 if act_logout() else 1
+    if cmd in ("license", "lic"):
+        head("Лицензия и аккаунт")
+        say(license_info())
+        say()
+        return 0
+
+    if cmd == "update":
+        return 0 if act_update(check_only=a.check) else 1
+
+    if cmd in ("menu", "ui"):
+        main_menu()
+        return 0
+
+    if cmd == "raw":
+        args = [x for x in (a.args or []) if x != "--"]
+        if not args:
+            err("нечего передавать")
+            return 2
+        return run_live(args)
+
+    return 2
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not have_cli():
+        err(f"adguardvpn-cli не найден в PATH (искал: {BIN})")
+        say("Установка:")
+        say("  curl -fsSL https://raw.githubusercontent.com/AdguardTeam/AdguardVPNCLI/HEAD/scripts/release/install.sh | sh -s -- -v")
+        return 127
+
+    if not argv:
+        try:
+            main_menu()
+        except KeyboardInterrupt:
+            say("\nПрервано.")
+            return 130
+        return 0
+
+    # raw обрабатываем до argparse, иначе он перехватывает флаги вроде --version
+    if argv[0] == "raw":
+        rest = [x for x in argv[1:] if x != "--"]
+        if not rest:
+            err("нечего передавать")
+            return 2
+        return run_live(rest)
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.cmd:
+        parser.print_help()
+        return 0
+    try:
+        return dispatch(args)
+    except KeyboardInterrupt:
+        say("\nПрервано.")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
