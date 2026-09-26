@@ -102,8 +102,3 @@ rm -f ~/.local/bin/agvpn
 rm -f ~/.local/share/bash-completion/completions/agvpn
 rm -rf ~/.config/agvpn
 ```
-
-## Конфиденциальность
-
-Личные данные VPN (учётные данные, избранное, история) в репозиторий не включаются.
-Файлы конфигурации исключены через `.gitignore`.
