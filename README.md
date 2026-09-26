@@ -18,12 +18,26 @@
 
 ## Установка
 
+Одной командой после клонирования:
+
+```bash
+git clone https://github.com/0xSecr/agvpn.git && cd agvpn && ./install.sh
+```
+
+Либо совсем одной командой (без клонирования, скачивает и запускает):
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/0xSecr/agvpn/main/install.sh)
+```
+
+Установка вручную:
+
 ```bash
 install -Dm 755 bin/agvpn ~/.local/bin/agvpn
 install -Dm 755 bin/bash-completion.sh ~/.local/share/bash-completion/completions/agvpn
 ```
 
-Добавьте `~/.local/bin` в `PATH`, если его там нет:
+Если `~/.local/bin` не в `PATH`, добавьте:
 
 ```bash
 printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> ~/.bashrc
