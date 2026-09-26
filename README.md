@@ -58,8 +58,3 @@ export PATH="$HOME/.local/bin:$PATH"
 adguardvpn-cli --version
 agvpn --version
 ```
-
-## Конфиденциальность
-
-Личные данные VPN (учётные данные, избранное, история) в репозиторий не включаются.
-Файлы конфигурации исключены через `.gitignore`.
