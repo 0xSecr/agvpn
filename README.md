@@ -2,6 +2,14 @@
 
 Удобная консольная оболочка над AdGuard VPN CLI (Python 3).
 
+## Быстрая установка (одной командой)
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/0xSecr/agvpn/main/install.sh)
+```
+
+Одна команда — скачивает и устанавливает всё автоматически.
+
 ## Возможности
 
 - интерактивное меню и полноценный CLI
