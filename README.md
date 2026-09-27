@@ -114,42 +114,6 @@ git -C ~/agvpn pull && ~/agvpn/install.sh
 
 или повторно запустите установку одной командой.
 
-## Как обновить версию и опубликовать её в GitHub
-
-Версия задаётся в `bin/agvpn`:
-
-```python
-VERSION = "2.0.0"
-```
-
-После исправлений измените номер, например на `2.0.1`, и добавьте в начало `CHANGELOG.md` раздел с номером версии, датой и списком изменений. Обновите текущую версию в README, затем выполните:
-
-```bash
-python3 -m py_compile bin/agvpn
-git diff --check
-git status
-git add README.md CHANGELOG.md bin/agvpn bin/bash-completion.sh
-git commit -m "Release 2.0.1"
-git push origin main
-git tag -a v2.0.1 -m "Release 2.0.1"
-git push origin v2.0.1
-```
-
-Если используется другая ветка, узнайте её имя командой `git branch --show-current` и замените `main` в команде `git push`.
-
-После публикации обновите установленную программу:
-
-```bash
-cd ~/agvpn
-./install.sh
-agvpn --version
-```
-
-Версия отображается в интерактивном меню под заголовком статуса.
-
-Теги сохраняют точный снимок каждого выпуска. Для отдельной страницы выпуска в GitHub откройте **Releases → Draft a new release**, выберите тег и скопируйте описание соответствующей версии из `CHANGELOG.md`.
-
-
 ## Удаление
 
 ```bash
