@@ -128,7 +128,7 @@ _adguardvpn_cli_completion() {
       ;;
     *)
       if [[ $COMP_CWORD -eq 1 ]]; then
-        local main_opts="login logout list-locations connect disconnect status license config check-update export-logs update site-exclusions ${_adguardvpn_cli_common_opts} -v --version"
+        local main_opts="login logout list-locations connect disconnect status license config check-update export-logs update site-exclusions language lang menu ${_adguardvpn_cli_common_opts} -v --version"
         COMPREPLY=($(compgen -W "${main_opts}" -- "$cur"))
       else
         local main_opts="${_adguardvpn_cli_common_opts}"
