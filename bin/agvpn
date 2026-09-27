@@ -28,7 +28,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 APP = "agvpn"
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
 BIN = os.environ.get("AGVPN_BIN") or shutil.which("adguardvpn-cli") or "adguardvpn-cli"
 DATA_DIR = Path.home() / ".local" / "share" / "adguardvpn-cli"
@@ -217,6 +217,14 @@ def load_state() -> dict:
         data = json.loads(STATE.read_text(encoding="utf-8"))
         merged = dict(DEFAULT_STATE)
         merged.update({k: v for k, v in data.items() if k in DEFAULT_STATE})
+        if not isinstance(merged.get("favorites"), list):
+            merged["favorites"] = []
+        if not isinstance(merged.get("profiles"), dict):
+            merged["profiles"] = {}
+        if not isinstance(merged.get("history"), list):
+            merged["history"] = []
+        if merged.get("language") not in TRANSLATIONS:
+            merged["language"] = "en"
         return merged
     except Exception:
         return dict(DEFAULT_STATE)
@@ -293,28 +301,28 @@ def run_live(args: list[str]) -> int:
 def cli(args: list[str], quiet: bool = False, timeout: int = 90) -> tuple[bool, str]:
     """Обёртка: печатает первую значимую строку вывода, возвращает (успех, текст)."""
     code, out, error = run(args, timeout=timeout)
-    text = out or error
-    low = text.lower()
+    output_text = out or error
+    low = output_text.lower()
 
     # Настройка записана, но не применилась к активному туннелю.
     # adguardvpn-cli отдаёт ненулевой код — для нас это успех + подсказка.
     if code != 0 and "config has been updated" in low:
         if not quiet:
-            ok("настройка сохранена")
+            ok(text("setting saved", "настройка сохранена"))
             if "active connection" in low:
                 warn(text("reconnect to apply: {app} r", "чтобы применить, переподключитесь: {app} r").format(app=APP))
-        return True, text
+        return True, output_text
 
     if code == 0:
-        if not quiet and text:
-            for line in text.splitlines():
+        if not quiet and output_text:
+            for line in output_text.splitlines():
                 if line.strip():
                     ok(line.strip())
                     break
-        return True, text
+        return True, output_text
     if not quiet:
-        err(text or translate("команда завершилась с кодом") + f" {code}")
-    return False, text
+        err(output_text or text("command failed with code {code}", "команда завершилась с кодом {code}").format(code=code))
+    return False, output_text
 
 
 # --------------------------------------------------------------------------
@@ -338,7 +346,7 @@ def parse_status(text: str) -> dict:
         "raw": text,
     }
     low = text.lower()
-    if "connected to" in low:
+    if re.search(r"(?<!not )connected to", low) and "not connected" not in low:
         st["connected"] = True
         m = re.search(r"Connected to\s+(.+?)\s+in\s+(\S+)\s+mode", text, re.I)
         if m:
@@ -406,9 +414,36 @@ def get_locations(count: int | None = None) -> list[dict]:
     return rows
 
 
-def license_info() -> str:
-    _, out, error = run(["license"], timeout=30)
-    return out or error
+def license_info() -> tuple[int, str]:
+    code, out, error = run(["license"], timeout=30)
+    return code, out or error
+
+
+def is_logged_in() -> bool:
+    """Проверить, выполнен ли вход в аккаунт AdGuard VPN."""
+    code, raw_info = license_info()
+    if code != 0 or not raw_info:
+        return False
+    info_text = raw_info.lower()
+    logged_out_markers = ("not logged in", "нужно войти", "не выполнен вход", "logged out")
+    if any(marker in info_text for marker in logged_out_markers):
+        return False
+    return "logged in as" in info_text or "выполнен вход" in info_text or ("account" in info_text and "@" in info_text)
+
+
+def require_login() -> bool:
+    """Не запускать рабочие функции без авторизации в AdGuard VPN."""
+    if is_logged_in():
+        return True
+    head(text("AdGuard account login required", "Требуется вход в аккаунт AdGuard"))
+    warn(text("You are not logged in to AdGuard VPN.", "Вы не вошли в аккаунт AdGuard VPN."))
+    say(text("To continue, run:", "Для продолжения выполните:"))
+    say("  adguardvpn-cli login")
+    say(text("Follow the instructions in the terminal or browser, then run agvpn again.",
+             "Следуйте инструкции в терминале или браузере, затем снова запустите agvpn."))
+    say(text("To log out later, run:", "Чтобы выйти из аккаунта, выполните:"))
+    say("  agvpn logout")
+    return False
 
 
 def iface_traffic(iface: str | None) -> tuple[int, int] | None:
@@ -540,7 +575,7 @@ def show_status(check_ip: bool = False, brief: bool = False) -> dict:
     if cfg.get("DNS upstream"):
         kv("DNS upstream", cfg["DNS upstream"])
 
-    lic = license_info()
+    _, lic = license_info()
     for line in lic.splitlines():
         low = line.lower()
         if "logged in as" in low:
@@ -1003,6 +1038,9 @@ PROFILE_KEYS = ("mode", "dns", "socks-port", "socks-host", "routing", "protocol"
 
 def act_profile_save(name: str) -> None:
     cfg = get_config()
+    if not cfg:
+        err(text("could not read current configuration; profile was not saved", "не удалось прочитать текущую конфигурацию; профиль не сохранён"))
+        return
     snapshot = {
         "mode": cfg.get("Mode", ""),
         "dns": cfg.get("DNS upstream", ""),
@@ -1037,8 +1075,12 @@ def act_profile_apply(name: str) -> bool:
     if not prof:
         err(text("profile «{name}» not found", "профиль «{name}» не найден").format(name=name))
         return False
+    if not get_config():
+        err(text("could not read current configuration; profile was not applied", "не удалось прочитать текущую конфигурацию; профиль не применён"))
+        return False
     head(text("Applying profile «{name}»", "Применяю профиль «{name}»").format(name=name))
     applied = 0
+    failed = 0
     for key in PROFILE_KEYS:
         raw = _clean(prof.get(key, ""))
         if not raw:
@@ -1051,6 +1093,11 @@ def act_profile_apply(name: str) -> bool:
             raw = raw.lower()
         if act_set(key, raw):
             applied += 1
+        else:
+            failed += 1
+    if failed:
+        warn(text("settings applied: {ok}, failed: {failed}", "применено настроек: {ok}, ошибок: {failed}").format(ok=applied, failed=failed))
+        return False
     ok(text("settings applied: {count}", "применено настроек: {count}").format(count=applied))
     return True
 
@@ -1088,8 +1135,7 @@ def ask(prompt: str, default: str = "") -> str:
     try:
         answer = input(f"{C.CYAN}?{C.RESET} {translate(prompt)}{suffix}: ").strip()
     except (EOFError, KeyboardInterrupt):
-        say()
-        return ""
+        raise SystemExit(130)
     return answer or default
 
 
@@ -1208,7 +1254,11 @@ def menu_settings() -> None:
                     user = ask("SOCKS логин")
                     if user:
                         act_set("socks-user", user)
-                        pwd = ask("SOCKS пароль")
+                        import getpass
+                        try:
+                            pwd = getpass.getpass(f"{C.CYAN}?{C.RESET} {translate('SOCKS пароль')}: ")
+                        except (EOFError, KeyboardInterrupt):
+                            raise SystemExit(130)
                         if pwd:
                             act_set("socks-pass", pwd)
         elif choice == "4":
@@ -1347,7 +1397,7 @@ def menu_tools() -> None:
             act_export_logs(ask("Путь для сохранения", str(Path.home())))
         elif choice == "8":
             head("Лицензия")
-            say(license_info())
+            say(license_info()[1])
             say()
         pause()
 
@@ -1355,7 +1405,7 @@ def menu_tools() -> None:
 def menu_account() -> None:
     clear_screen()
     head("Аккаунт")
-    say(license_info() or "нет данных")
+    say(license_info()[1] or text("no data", "нет данных"))
     say(f"\n  {C.B}1{C.RESET} {text('log in', 'войти')}      {C.B}2{C.RESET} {text('log out', 'выйти из аккаунта')}")
     say(f"\n  {C.B}0{C.RESET} {tr('back')}")
     choice = ask("Выбор")
@@ -1372,6 +1422,7 @@ def main_menu() -> None:
     while True:
         clear_screen()
         st = show_status()
+        say(f"{C.GREY}{APP} v{VERSION}{C.RESET}")
 
         toggle = f"{C.RED}{tr('disconnect')}{C.RESET}" if st["connected"] else f"{C.GREEN}{tr('connect')}{C.RESET}"
         say(f"  {C.B}1{C.RESET} {toggle} {tr('quick')}      {C.B}6{C.RESET} {tr('exclusions')}")
@@ -1421,6 +1472,9 @@ def main_menu() -> None:
             menu_tools()
         elif choice == "10":
             menu_account()
+            if not is_logged_in():
+                require_login()
+                return
         elif choice == "r":
             act_reconnect()
             pause()
@@ -1610,8 +1664,16 @@ def dispatch(a: argparse.Namespace) -> int:
         return 0 if st["connected"] else 1
 
     if cmd in ("locations", "ls", "l"):
+        rows = get_locations(a.count)
+        state = load_state()
+        if a.fav:
+            favs = {f.lower() for f in state.get("favorites", [])}
+            rows = [r for r in rows if r["city"].lower() in favs or r["iso"].lower() in favs]
+        if a.query:
+            q = a.query.lower()
+            rows = [r for r in rows if q in r["city"].lower() or q in r["country"].lower() or q == r["iso"].lower()]
         if a.json:
-            print(json.dumps(get_locations(a.count), ensure_ascii=False, indent=2))
+            print(json.dumps(rows, ensure_ascii=False, indent=2))
             return 0
         show_locations(count=a.count, query=a.query, favorites_only=a.fav)
         return 0
@@ -1691,7 +1753,7 @@ def dispatch(a: argparse.Namespace) -> int:
         return 0 if act_logout() else 1
     if cmd in ("license", "lic"):
         head("Лицензия и аккаунт")
-        say(license_info())
+        say(license_info()[1])
         say()
         return 0
 
@@ -1724,16 +1786,27 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Changing the UI language must work even before AdGuard VPN CLI is installed.
     if argv and argv[0] in ("language", "lang"):
-        if len(argv) > 1 and argv[1] in ("en", "ru"):
+        if len(argv) == 2 and argv[1] in ("en", "ru"):
             set_language(argv[1])
-        else:
+        elif len(argv) == 1:
             print(f"{tr('language')}: {LANG}")
+        else:
+            err(text("language must be en or ru", "язык должен быть en или ru"))
+            return 2
         return 0
-    if not have_cli():
-        err(f"adguardvpn-cli не найден в PATH (искал: {BIN})")
-        say("Установка:")
+    help_requested = any(arg in ("--help", "-h") for arg in argv)
+    version_requested = any(arg in ("--version", "-V") for arg in argv)
+    if not have_cli() and not (help_requested or version_requested):
+        err(text("adguardvpn-cli not found (looked for: {bin})", "не найден adguardvpn-cli (искал: {bin})").format(bin=BIN))
+        say(text("Installation:", "Установка:") )
         say("  curl -fsSL https://raw.githubusercontent.com/AdguardTeam/AdguardVPNCLI/HEAD/scripts/release/install.sh | sh -s -- -v")
         return 127
+
+    # Без авторизации разрешены только вход, выход, язык и справка.
+    allowed_without_login = {"login", "logout", "language", "lang", "--help", "-h", "--version", "-V"}
+    if not argv or (argv[0] not in allowed_without_login and not help_requested):
+        if not require_login():
+            return 1
 
     if not argv:
         try:
